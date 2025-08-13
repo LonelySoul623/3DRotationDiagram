@@ -1,0 +1,285 @@
+pipeline {
+    agent {
+        node {
+            label 'unity-build-agent'  // 使用专门的Unity构建节点
+        }
+    }
+    
+    options {
+        // 保留最近10次构建
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // 设置构建超时
+        timeout(time: 30, unit: 'MINUTES')
+        // 阻止并发构建同一分支
+        disableConcurrentBuilds()
+        // 构建时间戳
+        timestamps()
+    }
+    
+    parameters {
+        string(name: 'this_branch', defaultValue: 'main', description: '构建分支')
+        string(name: 'AUTO_job_projectVersion', defaultValue: '1.0.0', description: '项目版本')
+        booleanParam(name: 'FORCE_REBUILD', defaultValue: false, description: '强制重新构建（忽略缓存）')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: '跳过测试')
+    }
+    
+    environment {
+        // Unity相关环境变量
+        UNITY_PATH = 'D:\\Unity Hub\\Editor\\2021.2.8f1c1\\Editor\\Unity.exe'
+        PROJECT_PATH = "${WORKSPACE}\\pj_xr_holographic"
+        CACHE_DIR = "${WORKSPACE}\\.unity_cache"
+        
+        // 性能优化环境变量
+        UNITY_MIXED_CALLSTACK = '1'
+        UNITY_SHADER_COMPILER_TASK_TIMEOUT_MINUTES = '30'
+        
+        // Git优化
+        GIT_LFS_SKIP_SMUDGE = '1'  // 如果使用Git LFS，可以在构建时跳过
+    }
+    
+    stages {
+        stage('Preparation') {
+            parallel {
+                stage('Environment Check') {
+                    steps {
+                        script {
+                            echo "构建分支: ${params.this_branch}"
+                            echo "项目版本: ${params.AUTO_job_projectVersion}"
+                            echo "工作空间: ${WORKSPACE}"
+                            
+                            // 检查Unity安装
+                            bat """
+                                if not exist "${UNITY_PATH}" (
+                                    echo [ERROR] Unity路径不存在: ${UNITY_PATH}
+                                    exit /b 1
+                                )
+                                echo [INFO] Unity版本检查:
+                                "${UNITY_PATH}" -version -batchmode -quit
+                            """
+                        }
+                    }
+                }
+                
+                stage('Cache Setup') {
+                    steps {
+                        // 创建缓存目录
+                        bat """
+                            if not exist "${CACHE_DIR}" mkdir "${CACHE_DIR}"
+                            if not exist "${WORKSPACE}\\origin" mkdir "${WORKSPACE}\\origin"
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Smart Git Sync') {
+            when {
+                not { params.FORCE_REBUILD }
+            }
+            steps {
+                script {
+                    def gitChanged = false
+                    
+                    if (fileExists('.git')) {
+                        // 获取当前commit
+                        def localCommit = bat(returnStdout: true, script: 'git rev-parse HEAD 2>nul').trim()
+                        
+                        // 轻量级fetch
+                        bat "git fetch origin ${params.this_branch} --depth=1"
+                        
+                        // 获取远程commit
+                        def remoteCommit = bat(returnStdout: true, script: "git rev-parse origin/${params.this_branch} 2>nul").trim()
+                        
+                        if (localCommit != remoteCommit) {
+                            echo "代码有变更，执行同步..."
+                            bat """
+                                git checkout -f ${params.this_branch}
+                                git reset --hard origin/${params.this_branch}
+                            """
+                            gitChanged = true
+                        } else {
+                            echo "代码无变更，跳过同步"
+                        }
+                        
+                        env.CODE_CHANGED = gitChanged.toString()
+                    }
+                }
+            }
+        }
+        
+        stage('Full Git Sync') {
+            when {
+                params.FORCE_REBUILD
+            }
+            steps {
+                bat """
+                    git fetch origin ${params.this_branch}
+                    git checkout -f ${params.this_branch}
+                    git reset --hard origin/${params.this_branch}
+                """
+                script {
+                    env.CODE_CHANGED = 'true'
+                }
+            }
+        }
+        
+        stage('Build Check') {
+            steps {
+                script {
+                    if (!params.FORCE_REBUILD) {
+                        // 检查是否需要重新构建
+                        def buildHashFile = "${CACHE_DIR}\\last_build_hash.txt"
+                        def currentHash = "${params.this_branch}_${params.AUTO_job_projectVersion}"
+                        
+                        if (fileExists(buildHashFile)) {
+                            def lastHash = readFile(buildHashFile).trim()
+                            def outputDir = "${WORKSPACE}\\origin\\${params.this_branch.replaceAll('/', '_')}_${params.AUTO_job_projectVersion}"
+                            
+                            if (lastHash == currentHash && fileExists("${outputDir}\\Holo.exe")) {
+                                echo "检测到相同构建状态，使用缓存结果"
+                                currentBuild.result = 'SUCCESS'
+                                return
+                            }
+                        }
+                    }
+                    
+                    env.NEED_BUILD = 'true'
+                }
+            }
+        }
+        
+        stage('Unity Build') {
+            when {
+                environment name: 'NEED_BUILD', value: 'true'
+            }
+            steps {
+                script {
+                    def outputDir = "${WORKSPACE}\\origin\\${params.this_branch.replaceAll('/', '_')}_${params.AUTO_job_projectVersion}"
+                    
+                    // 清理旧构建产物
+                    if (fileExists(outputDir)) {
+                        bat "rmdir /s /q \"${outputDir}\" 2>nul || echo 目录不存在"
+                    }
+                    bat "mkdir \"${outputDir}\""
+                    
+                    // 如果代码有变化，清理部分缓存
+                    if (env.CODE_CHANGED == 'true') {
+                        bat """
+                            if exist "${PROJECT_PATH}\\Library\\ScriptAssemblies" (
+                                echo [INFO] 清理脚本程序集缓存...
+                                rmdir /s /q "${PROJECT_PATH}\\Library\\ScriptAssemblies" 2>nul
+                            )
+                        """
+                    }
+                    
+                    // 执行Unity构建
+                    bat """
+                        "${UNITY_PATH}" ^
+                          -batchmode ^
+                          -quit ^
+                          -nographics ^
+                          -buildTarget Win64 ^
+                          -projectPath "${PROJECT_PATH}" ^
+                          -executeMethod BuilldPlayerTools.BuildPlayer ^
+                          -productName=Holo ^
+                          -version=${params.AUTO_job_projectVersion} ^
+                          -prefixDir="${outputDir}" ^
+                          -logFile "${WORKSPACE}\\unity_build.log" ^
+                          -cacheServerEndpoint none ^
+                          -buildCacheVersion 1 ^
+                          -enableCacheServer false
+                    """
+                    
+                    // 验证构建结果
+                    if (!fileExists("${outputDir}\\Holo.exe")) {
+                        error "构建失败：未生成Holo.exe文件"
+                    }
+                    
+                    // 保存构建hash
+                    def buildHash = "${params.this_branch}_${params.AUTO_job_projectVersion}"
+                    writeFile file: "${CACHE_DIR}\\last_build_hash.txt", text: buildHash
+                }
+            }
+            post {
+                failure {
+                    // 构建失败时显示日志
+                    script {
+                        if (fileExists("${WORKSPACE}\\unity_build.log")) {
+                            def logContent = readFile("${WORKSPACE}\\unity_build.log")
+                            def errorLines = logContent.split('\n').findAll { 
+                                it.toLowerCase().contains('error') || 
+                                it.toLowerCase().contains('fail') || 
+                                it.toLowerCase().contains('exception')
+                            }
+                            echo "Unity构建错误信息："
+                            errorLines.each { echo it }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Post Processing') {
+            parallel {
+                stage('Archive Results') {
+                    steps {
+                        script {
+                            def outputDir = "${WORKSPACE}\\origin\\${params.this_branch.replaceAll('/', '_')}_${params.AUTO_job_projectVersion}"
+                            def zipPath = "${outputDir}.zip"
+                            
+                            // 压缩构建结果
+                            bat """
+                                if exist "${zipPath}" del "${zipPath}"
+                                powershell -Command "Compress-Archive -Path '${outputDir}\\*' -DestinationPath '${zipPath}' -CompressionLevel Fastest"
+                            """
+                            
+                            // 归档构建产物
+                            archiveArtifacts artifacts: "origin/${params.this_branch.replaceAll('/', '_')}_${params.AUTO_job_projectVersion}/**/*", fingerprint: true
+                            archiveArtifacts artifacts: "origin/${params.this_branch.replaceAll('/', '_')}_${params.AUTO_job_projectVersion}.zip", fingerprint: true
+                        }
+                    }
+                }
+                
+                stage('Cleanup') {
+                    steps {
+                        // 清理旧的日志文件（保留最新5个）
+                        bat """
+                            for /f "skip=5 delims=" %%i in ('dir /b /o-d "${WORKSPACE}\\unity_build*.log" 2^>nul') do del "${WORKSPACE}\\%%i" 2>nul || echo 无旧日志文件
+                        """
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // 发布构建日志
+            publishHTML([
+                allowMissing: false,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: '.',
+                reportFiles: 'unity_build.log',
+                reportName: 'Unity Build Log'
+            ])
+        }
+        
+        success {
+            echo "构建成功完成！"
+            // 可以添加通知逻辑
+        }
+        
+        failure {
+            echo "构建失败，请检查日志"
+            // 可以添加失败通知逻辑
+        }
+        
+        cleanup {
+            // 清理工作空间中的临时文件，但保留缓存
+            bat """
+                if exist "${WORKSPACE}\\temp" rmdir /s /q "${WORKSPACE}\\temp" 2>nul
+            """
+        }
+    }
+}
