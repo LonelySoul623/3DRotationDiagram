@@ -34,11 +34,17 @@ echo [DEBUG] 压缩包路径: %ZIP_PATH%
 
 :: ==== 优化的Git同步策略 ====
 echo [INFO] 开始智能代码同步...
-if exist ".git" (
-    :: 获取当前本地和远程commit hash
+if exist "%PROJECT_PATH%\.git" (
+    echo [DEBUG] Git仓库位置: %PROJECT_PATH%
+    
+    :: 切换到项目目录执行Git操作
+    pushd "%PROJECT_PATH%"
+    
+    :: 获取当前本地commit hash
     for /f "tokens=*" %%i in ('git rev-parse HEAD 2^>nul') do set "LOCAL_COMMIT=%%i"
     
     :: 先fetch获取最新远程信息（轻量级操作）
+    echo [DEBUG] 正在获取远程分支信息: %BRANCH%
     git fetch origin %BRANCH% --depth=1 2>nul
     
     :: 获取远程commit hash
@@ -56,9 +62,43 @@ if exist ".git" (
         git reset --hard origin/%BRANCH%
         set "CODE_CHANGED=true"
     )
+    
+    :: 返回原目录
+    popd
 ) else (
-    echo [WARN] 非Git仓库，跳过代码同步
-    set "CODE_CHANGED=true"
+    echo [WARN] 在项目路径中未找到Git仓库: %PROJECT_PATH%\.git
+    echo [DEBUG] 检查是否在工作空间根目录有Git仓库...
+    if exist "%WORKSPACE%\.git" (
+        echo [INFO] 在工作空间根目录找到Git仓库，切换到该目录
+        pushd "%WORKSPACE%"
+        
+        :: 获取当前本地commit hash
+        for /f "tokens=*" %%i in ('git rev-parse HEAD 2^>nul') do set "LOCAL_COMMIT=%%i"
+        
+        :: 先fetch获取最新远程信息
+        git fetch origin %BRANCH% --depth=1 2>nul
+        
+        :: 获取远程commit hash
+        for /f "tokens=*" %%i in ('git rev-parse origin/%BRANCH% 2^>nul') do set "REMOTE_COMMIT=%%i"
+        
+        echo [DEBUG] 本地commit: %LOCAL_COMMIT%
+        echo [DEBUG] 远程commit: %REMOTE_COMMIT%
+        
+        if "%LOCAL_COMMIT%"=="%REMOTE_COMMIT%" (
+            echo [INFO] 代码已是最新，跳过同步步骤
+            set "CODE_CHANGED=false"
+        ) else (
+            echo [INFO] 检测到代码变更，执行同步...
+            git checkout -f %BRANCH%
+            git reset --hard origin/%BRANCH%
+            set "CODE_CHANGED=true"
+        )
+        
+        popd
+    ) else (
+        echo [WARN] 未找到Git仓库，跳过代码同步
+        set "CODE_CHANGED=true"
+    )
 )
 
 :: ==== 初始化目录（强制创建） ====
