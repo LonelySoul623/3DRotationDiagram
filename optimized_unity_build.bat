@@ -120,7 +120,6 @@ set UNITY_SHADER_COMPILER_TASK_TIMEOUT_MINUTES=30
 "%UNITY_PATH%" ^
   -batchmode ^
   -quit ^
-  -nographics ^
   -buildTarget Win64 ^
   -projectPath "%PROJECT_PATH%" ^
   -executeMethod BuilldPlayerTools.BuildPlayer ^
